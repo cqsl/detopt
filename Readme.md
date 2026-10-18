@@ -15,9 +15,11 @@ pip install .
 ### to run:
 
 ground state:
-- `sld-optimize`: optimization
+- `sld-optimize`: optimization, optionally of the spin and symmetry projected state
 - `sld-optimize-partial`: optimization of the orbitals of only a subset of the determinants per step
 - `sld-postprocess`: energy, variance and ⟨S²⟩
+- `sld-postprocess-symm`: symmetry and spin projection, dipole moment
+- `sld-show-symm`: print the state with its symmetry labels
 
 see [examples/ground_state](examples/ground_state)
 

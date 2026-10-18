@@ -16,6 +16,8 @@ from sld.mels import compute_mels_static_uhf_spin_blocks, get_impls, static_uhf_
 from sld.mels.autobatch import auto_batch_size, auto_batch_size_from_lowering, auto_cached_batch_size, check_full_hessian_output_memory
 from sld.mels._src.hybrid import uhf as hybrid_uhf
 from sld.utils.io import load_h5, record_settings, save_h5
+from sld.symmetry_projection import get_projected_hess_impl
+from sld.symmetry_projection.projection_setup import prep_vap_trafos
 from sld.scripts._helpers import HYBRID_UHF_BACKENDS, init_seed_and_key, checkpoint_filename, run_training_loop, add_uhf_backend_args, resolve_uhf_backend, check_uhf_backend_hamiltonian, describe_uhf_backend, check_lanczos_args, record_solver_settings, two_electrons, OPTIMIZE_SETTINGS
 
 
@@ -147,6 +149,11 @@ def main():
     parser.add_argument("--s2_loss", type=float, required=False, help="add a S^2 penalty term to the Hamiltonian, scaled by the value of this argument")
     parser.add_argument("--orthogao", action="store_true", help="diagonalize the overlap matrix to get orthogonal orbitals, and do NOT run a HF calculation or use MO")
     parser.add_argument("--cart", action="store_true", help="use cart orbitals instead of sph")
+    group = parser.add_argument_group("variation after projection", "minimize ⟨Ĥ P̂⟩/⟨P̂⟩ instead of the energy, with the pairwise backend and the dense solver")
+    group.add_argument("--project_spin", type=int, metavar="S", help="project onto total spin S (UHF: at the Sz of --spin)")
+    group.add_argument("--project_irrep", type=str, metavar="Γ", help="project onto this point-group irrep; for linear molecules the parities g/u and +/-, e.g. u or g+")
+    group.add_argument("--project_lz", type=int, metavar="Λ", help="project onto |Lz| = Λ (linear molecules)")
+    group.add_argument("--linear_subgroup", type=str.lower, choices=("d2h", "d4h"), help="linear molecules: --project_irrep takes the irreps of this finite subgroup of D∞h instead of the parities, e.g. A1g of d4h")
 
     args = parser.parse_args()
 
@@ -172,6 +179,15 @@ def main():
     cholesky = not args.dense_solver
     nfreeze = args.nfreeze
 
+    project = any(p is not None for p in (args.project_spin, args.project_irrep, args.project_lz))
+    if project:
+        if args.backend not in (None, "pairwise"):
+            parser.error("the projection needs --backend pairwise")
+        if nfreeze is not None or particle_hole or (s2_loss is not None and args.project_spin is not None):
+            parser.error("the projection does not support --nfreeze, --particle_hole or --s2_loss with --project_spin")
+        args.backend = "pairwise"
+        # the projected Hessian has no spin blocks
+        args.independent_spins = True
     backend = resolve_uhf_backend(parser, args, HYBRID_KINDS, ghf, unstable, ndet)
     check_lanczos_args(parser, args)
     if cplx:
@@ -188,7 +204,22 @@ def main():
         print("two electrons, using the dense solver")
         cholesky = False
         args.dense_solver = True
-    impls = get_impls(ghf, unstable)
+    if project:
+        if args.project_spin is not None and sum(np.atleast_1d(nelec)) % 2:
+            raise NotImplementedError("--project_spin with an odd number of electrons (half-integer S)")
+        if cholesky:
+            # the projector adds null directions to the overlap that the Cholesky solver does not know about
+            print("projection, using the dense solver")
+            cholesky = False
+            args.dense_solver = True
+        weights, trafos = prep_vap_trafos(xyzstr, basis, mo_coeff, nelec, S_proj=args.project_spin, irrep=args.project_irrep, lz_proj=args.project_lz, cart=cart, linear_subgroup=args.linear_subgroup or "dinftyh", charge=args.charge)
+        spin_rotation = args.project_spin is not None and not ghf
+        if spin_rotation:
+            # the spin rotations mix up and down, so the UHF determinants see the GHF hamiltonian
+            hamiltonian = build_hamiltonian(xyzstr, basis, spin, cart, None, unstable, True, particle_hole, orthogao, nfreeze, mo_coeff=mo_coeff, charge=args.charge)[0]
+        impls = get_projected_hess_impl(ghf, unstable, ghf_operator=spin_rotation, weights=jnp.asarray(weights), trafos=jnp.asarray(trafos))
+    else:
+        impls = get_impls(ghf, unstable)
     describe_uhf_backend(backend, HYBRID_KINDS, unstable, ghf)
 
     seed, key = init_seed_and_key(seed)
