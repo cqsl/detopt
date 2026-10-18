@@ -3,125 +3,105 @@ import jax.numpy as jnp
 from functools import partial
 
 
-from ..common import ol
-from sld.utils.sparse import einsum_maybe_sparse
+from ..common import antisymmetrized, ol
+
+
+def inv_and_det(A):
+    n = A.shape[-1]
+    lu, piv, perm = jax.lax.linalg.lu(A)
+    P = jax.nn.one_hot(perm, n, dtype=A.dtype)
+    y = jax.lax.linalg.triangular_solve(lu, P, left_side=True, lower=True, unit_diagonal=True)
+    Ainv = jax.lax.linalg.triangular_solve(lu, y, left_side=True, lower=False)
+    sign = 1 - 2 * (jnp.count_nonzero(piv != jnp.arange(n, dtype=piv.dtype)) % 2)
+    # not jnp.diagonal, its gather breaks with the "i" sharding
+    return Ainv, sign * (lu * jnp.eye(n, dtype=A.dtype)).sum(axis=-1).prod()
 
 
 def inv(A):
-    # workaround for ShardingTypeError: All inputs to triangular_solve must have the same batch sharding
-    # TODO fix it properly
-    # I = 0.*A+jnp.eye(A.shape[0], dtype=A.dtype, device=jax.typeof(A).sharding)
-    # I = jax.lax.pvary(I, tuple(jax.typeof(A).vma))
-    # return jnp.linalg.solve(A, I)
-    u, s, vt = jnp.linalg.svd(A)
-    return jnp.einsum("ij,j,jk->ki", u.conj(), 1.0 / s, vt.conj())
+    return inv_and_det(A)[0]
 
 
-def rdm1_red(Aconj, B, v=None, return_mat=False):
-    # without det M
-    M = Aconj @ B.T
-    M_inv = inv(M)
+def rdm1_red_from_inverse(Aconj, B, M_inv, v=None):
     if v is None:
-        res = jnp.einsum("ki,kl,lj->ij", B, M_inv, Aconj)
-    else:
-        res = jnp.einsum("ki,kl,lj,j...->i...", B, M_inv, Aconj, v)
-    if return_mat:
-        # use svd here and not eig, since batched jax.lax.eig runs on cpu per default on small matrices,
-        # and even if you set implementation='CUSOLVER' it is very slow
-        _, ev, _ = jax.lax.linalg.svd(M)
-        return res, (jnp.abs(ev).min() / jnp.abs(ev).max())
-    else:
-        return res
+        return jnp.einsum("ki,kl,lj->ij", B, M_inv, Aconj)
+    return jnp.einsum("ki,kl,lj,j...->i...", B, M_inv, Aconj, v)
 
 
-def rdm1_full(Uconj, V, v=None, return_mat=False):
-    if return_mat:
-        res, M = rdm1_red(Uconj, V, v=v, return_mat=True)
-        return res * ol(Uconj, V), M
-    else:
-        return rdm1_red(Uconj, V, v=v) * ol(Uconj, V)
+def rdm1_red_and_det(Aconj, B, v=None):
+    M_inv, determinant = inv_and_det(Aconj @ B.T)
+    return rdm1_red_from_inverse(Aconj, B, M_inv, v=v), determinant
 
 
-def E1e(Aconj, B, H1e, mo_coeff=None, _red=False):
+def rdm1_red(Aconj, B, v=None):
+    # without det M
+    return rdm1_red_from_inverse(Aconj, B, inv(Aconj @ B.T), v=v)
+
+
+def rdm1_full(Uconj, V, v=None):
+    res, determinant = rdm1_red_and_det(Uconj, V, v=v)
+    return res * determinant
+
+
+def E1e(Aconj, B, H1e, _red=False):
     if H1e is None:
         return 0.0
-    M = Aconj @ B.T
-    r1 = rdm1_red(Aconj, B)
-    if mo_coeff is None:
-        E1_red = jnp.einsum("ba,ab", r1, H1e)
+    if _red:
+        r1 = rdm1_red(Aconj, B)
+        determinant = None
     else:
-        r1ao = jnp.einsum("ba,Aa,Bb->AB", r1, mo_coeff, mo_coeff)
-        E1_red = jnp.einsum("AB,AB", H1e, r1ao)
+        r1, determinant = rdm1_red_and_det(Aconj, B)
+
+    E1_red = jnp.einsum("ba,ab", r1, H1e)
+
     if _red:
         return E1_red
     else:
-        return jnp.linalg.det(M) * E1_red
+        return determinant * E1_red
 
 
 E1e_red = partial(E1e, _red=True)
 
 
-def E2e(Aconj, B, H2e, mo_coeff=None, _red=False):
+def E2e(Aconj, B, H2e, _red=False):
     if H2e is None:
         return 0.0
-    M = Aconj @ B.T
-    r1 = rdm1_red(Aconj, B)
-
-    if mo_coeff is None:
-        r1ao = r1
+    if _red:
+        r1 = rdm1_red(Aconj, B)
+        determinant = None
     else:
-        r1ao = jnp.einsum("ab,Aa,Bb->AB", r1, mo_coeff, mo_coeff)
+        r1, determinant = rdm1_red_and_det(Aconj, B)
 
-    if isinstance(H2e, tuple):
-        _, Ht, _ = H2e
-        E2_red = jnp.einsum("abge,ea,gb", Ht, r1ao, r1ao)
-    else:
-        E2_red_a = +einsum_maybe_sparse("abge,ea,gb", H2e, r1ao, r1ao, notation="physicist")
-        E2_red_b = -einsum_maybe_sparse("abge,ga,eb", H2e, r1ao, r1ao, notation="physicist")
-        E2_red = E2_red_a + E2_red_b
+    _, Ht, _ = antisymmetrized(H2e)
+    E2_red = jnp.einsum("abge,ea,gb", Ht, r1, r1)
     if _red:
         return E2_red
     else:
-        return jnp.linalg.det(M) * E2_red
+        return determinant * E2_red
 
 
 E2e_red = partial(E2e, _red=True)
 
 
-def expval(X1c, X2, deriv_indices=None, hamiltonian=None, mo_coeff=None):
+def expval(X1c, X2, deriv_indices=None, hamiltonian=None):
     # compute <>, <H>
     # GHF version;
     # non-svd version; assumes overlap is nonzero
 
-    if mo_coeff is not None:
-        raise NotImplementedError
-
     ol_ = ol(X1c, X2)
 
     if hamiltonian is None:
-        H2e, H1e, Enuc = None, None, 1
-    else:
-        H2e, H1e, Enuc = hamiltonian
+        hamiltonian = {}
+
+    H2e = hamiltonian.get('H2e', None)
+    H1e = hamiltonian.get('H1e', None)
+    Enuc = hamiltonian.get('Enuc', 0)
 
     e0_ = Enuc
-    e1_ = E1e_red(X1c, X2, H1e, mo_coeff=mo_coeff)
-    e2_ = E2e_red(X1c, X2, H2e, mo_coeff=mo_coeff)
+    e1_ = E1e_red(X1c, X2, H1e)
+    e2_ = E2e_red(X1c, X2, H2e)
     expval = ol_ * (e0_ + e1_ + e2_)
     return ol_[None, None], expval[None, None]
 
 
-def expval_sq(X1c, X2, deriv_indices=None, hamiltonian=None, mo_coeff=None, _sq=True):
-    if mo_coeff is not None:
-        raise NotImplementedError  # TODO
-
-    # compute <>, <H^2> and <H>
-    # GHF version;
-    # svd version; works with zero overlap
-
-    ol_ = ol(X1c, X2)
-
-    if hamiltonian is None:
-        return ol_[None, None], ol_[None, None], ol_[None, None]
-    else:
-        # TODO
-        raise NotImplementedError
+def expval_sq(X1c, X2, deriv_indices=None, hamiltonian=None):
+    raise NotImplementedError("<H^2> has no unstable implementation; use the stable or hybrid one")

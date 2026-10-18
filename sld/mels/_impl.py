@@ -8,3 +8,4 @@ class Impl:
     grad: Partial = None
     expval: Partial = None
     expval_sq: Partial = None
+    hess_spin_blocks: tuple = None

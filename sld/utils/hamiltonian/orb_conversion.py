@@ -1,8 +1,6 @@
-import jax
 import jax.numpy as jnp
 
 import numpy as np
-from functools import partial
 
 def spinorb_one_body(hij):
     # Σ_ijσ h_ij c†_iσ c_jσ, spin orbitals ordered n*spin+i
@@ -31,15 +29,3 @@ def spinorb_from_spatial2(hij, hijkl):
 
 def uhf2ghf(Xu, Xd):
     return jnp.block([[Xu, jnp.zeros_like(Xu)], [jnp.zeros_like(Xd), Xd]])
-
-
-@partial(jax.jit, static_argnames="set_zero_same")
-def to_desc_order_dense(vijkl, cutoff, set_zero_same=True):
-    if not set_zero_same:
-        raise NotImplementedError
-    L = jnp.tril(jnp.ones((vijkl.shape[0], vijkl.shape[0]), dtype=vijkl.dtype), -1)
-    res = jnp.einsum("ijkl,ij,kl->ijkl", vijkl, L, L)
-    res += jnp.einsum("jilk,ij,kl->ijkl", vijkl, L, L)
-    res += -jnp.einsum("ijlk,ij,kl->ijkl", vijkl, L, L)
-    res += -jnp.einsum("jikl,ij,kl->ijkl", vijkl, L, L)
-    return res
