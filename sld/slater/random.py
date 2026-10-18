@@ -13,12 +13,14 @@ def random_unitary_matrix(key, dim, shape=(), dtype=complex, su=False):
     d = r.diagonal(offset=0, axis1=-2, axis2=-1)
     q *= jnp.sign(d)[..., None, :]
     if su:
-        q = q * jnp.linalg.det(q)[..., None, None] ** (-1.0 / dim)
+        determinant = jnp.linalg.det(q)
+        phase = determinant / jnp.abs(determinant)
+        q = q.at[..., :, 0].multiply(phase.conj()[..., None])
     return q
 
 
 def random_dets(key, ndet, nelec, n_orbitals, dtype=complex, coeff=200, stddev=0.001, normalize=True):
-    key, k0, k1, k2, k3 = jax.random.split(key, 5)
+    k0, k2 = jax.random.split(key)
 
     real_dtype = jnp.zeros((0,), dtype=dtype).real.dtype
     cplx = jnp.issubdtype(dtype, jnp.complexfloating)
@@ -35,10 +37,10 @@ def randomly_rotate_orbitals(key, Xs):
     k1, k2 = jax.random.split(key)
     ghf = not isinstance(Xs, tuple)
     if not ghf:  # UHF
-        U0 = random_unitary_matrix(k1, Xs[0].shape[-2], Xs[0].shape[:-2], dtype=Xs[0].dtype)
-        U1 = random_unitary_matrix(k2, Xs[1].shape[-2], Xs[1].shape[:-2], dtype=Xs[1].dtype)
+        U0 = random_unitary_matrix(k1, Xs[0].shape[-2], Xs[0].shape[:-2], dtype=Xs[0].dtype, su=True)
+        U1 = random_unitary_matrix(k2, Xs[1].shape[-2], Xs[1].shape[:-2], dtype=Xs[1].dtype, su=True)
         Xs = jnp.einsum("...ij,...ik->...jk", U0, Xs[0]), jnp.einsum("...ij,...ik->...jk", U1, Xs[1])
     else:
-        U = random_unitary_matrix(k1, Xs.shape[-2], Xs.shape[:-2], dtype=Xs.dtype)
+        U = random_unitary_matrix(k1, Xs.shape[-2], Xs.shape[:-2], dtype=Xs.dtype, su=True)
         Xs = jnp.einsum("...ij,...ik->...jk", U, Xs)
     return Xs

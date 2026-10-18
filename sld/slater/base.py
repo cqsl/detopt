@@ -3,6 +3,9 @@ import jax.numpy as jnp
 
 
 class SSDBASE:
+    # let np use our operators (e.g. __rmul__) instead of converting to an array
+    __array_ufunc__ = None
+
     def __len__(self):
         return self.ndet
 

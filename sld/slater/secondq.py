@@ -24,7 +24,11 @@ def slater_ansatz_index(Xi, n, transposed, slogdet_impl):
     return logdet + jnp.log(sgn + 0.0j)
 
 
-vslater_ansatz_index = jax.vmap(partial(slater_ansatz_index, slogdet_impl=jnp.linalg.slogdet, transposed=True), in_axes=(0, None))
+def _slater_ansatz_index(Xi, n):
+    return slater_ansatz_index(Xi, n, True, jnp.linalg.slogdet)
+
+
+vslater_ansatz_index = jax.vmap(_slater_ansatz_index, in_axes=(0, None))
 
 
 def slater_ansatz_index_split_spin(Xi, Xi2, n, transposed, slogdet_impl):

@@ -76,10 +76,6 @@ class GSSD(SSDBASE):
         logpsi = vslater_ansatz_index(self.X, n)
         return self.coeffs @ jnp.exp(logpsi)
 
-    # TODO gbasis stuff
-    # def firstq_eval(self, r):
-    #     raise NotImplementedError
-
     def choose_random_orbitals_to_optimize(self, key, optimize_first_only=False):
         assert self.i is None
         if optimize_first_only:
@@ -115,10 +111,15 @@ class GSSD(SSDBASE):
     def get_orbitals_weighted(self, i=None):
         return self.coeffs[:, None] * self.get_orbitals(i=i)
 
+    def unfreeze(self, nfreeze):
+        X = jnp.repeat(jnp.eye(self.n_orbitals + nfreeze, dtype=self.dtype)[None, :nfreeze, :], self.ndet, axis=0)
+        X = jnp.concatenate([X, jnp.pad(self.X, ((0, 0), (0, 0), (nfreeze, 0)))], axis=1)
+        return self.replace(X=X)
+
     @property
     def n_zero_eigvals(self):
         return (self.nelec - 1) * self.ndet
 
-    # backward compat for saving; TODO remove or rename
+    # orbitals with the coefficients absorbed, as stored in the output files
     def _to_nonnormalized_arrays(self):
         return self.X * jnp.exp(jnp.log(self.coeffs)[:, None, None] / self.nelec)

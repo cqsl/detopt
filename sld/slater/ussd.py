@@ -91,13 +91,13 @@ class USSD(SSDBASE):
         return self.coeffs @ jnp.exp(logpsi)
 
     def to_generalized(self, i=None, s=None):
-        # conversion to GHF, needed for some of the symmetry proejctions
+        # conversion to GHF, needed for some of the symmetry projections
         if s is None:
             s = self.s
         if i is None:
             i = self.i
 
-        X = jax.vmap(lambda Xu, Xd: jnp.block([[Xu, jnp.zeros_like(Xu)], [jnp.zeros_like(Xd), Xd]]), self.Xu, self.Xd)
+        X = jax.vmap(lambda Xu, Xd: jnp.block([[Xu, jnp.zeros_like(Xu)], [jnp.zeros_like(Xd), Xd]]))(self.Xu, self.Xd)
 
         if i is not None:
             assert s is not None
@@ -106,15 +106,10 @@ class USSD(SSDBASE):
             i = (1 - s) * ku + s * (kd + ne_u)
         return GSSD(X, self.coeffs, i)
 
-    # TODO gbasis stuff
-    # def firstq_eval(self, r):
-    #     raise NotImplementedError
-
     def choose_random_orbitals_to_optimize(self, key, optimize_first_only=False):
         assert self.i is None
         assert self.s is None
         k1, k2, k3 = jax.random.split(key, 3)
-        # TODO choose spin proportional to number of electrons in each sector?
         s = jax.random.randint(k1, minval=0, maxval=2, shape=self.ndet, dtype=jnp.int32)
         if optimize_first_only:
             i = jnp.zeros((self.ndet, 2), dtype=jnp.int32)
@@ -168,6 +163,13 @@ class USSD(SSDBASE):
     def get_orbitals_weighted(self, s=None, i=None):
         return self.coeffs[:, None] * self.get_orbitals(s=s, i=i)
 
-    # backward compat for saving; TODO remove or rename
+    def unfreeze(self, nfreezeu, nfreezed):
+        Xu = jnp.repeat(jnp.eye(self.n_orbitals + nfreezeu, dtype=self.dtype)[None, :nfreezeu, :], self.ndet, axis=0)
+        Xu = jnp.concatenate([Xu, jnp.pad(self.Xu, ((0, 0), (0, 0), (nfreezeu, 0)))], axis=1)
+        Xd = jnp.repeat(jnp.eye(self.n_orbitals + nfreezed, dtype=self.dtype)[None, :nfreezed, :], self.ndet, axis=0)
+        Xd = jnp.concatenate([Xd, jnp.pad(self.Xd, ((0, 0), (0, 0), (nfreezed, 0)))], axis=1)
+        return self.replace(Xu=Xu, Xd=Xd)
+
+    # orbitals with the coefficients absorbed, as stored in the output files
     def _to_nonnormalized_arrays(self):
         return jax.tree.map(lambda X: X * jnp.exp(jnp.log(self.coeffs)[:, None, None] / sum(self.nelec)), (self.Xu, self.Xd))
