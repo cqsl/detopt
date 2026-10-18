@@ -49,7 +49,11 @@ def print_states(nstates, data, table2, tol=0.1, columns=None):
         for k in t[0]:
             label = str(label_table.get(k, k))
             symmetry_columns.append((label, max(6, len(label))))
-    header = f'k  | {"E [a.u.]":>14} | {"var [a.u.]":>12} '
+    # the frozen-core variance for runs with frozen core orbitals
+    e2 = 'e2_fc' if 'e2_fc' in data else 'e2'
+    # Sz only when it differs between the states (GHF)
+    sz = 'sz' in data and np.ptp(np.real(data['sz'])) > 1e-6
+    header = f'k  | {"E [a.u.]":>14} | {("var_fc" if e2 == "e2_fc" else "var") + " [a.u.]":>13} ' + (f'| {"Sz":>6} ' if sz else '')
     for label, width in symmetry_columns:
         header += f'| {label:>{width}} '
     header += f'| {"State":6} | {"E-E_00 [eV]":>10}'
@@ -63,9 +67,9 @@ def print_states(nstates, data, table2, tol=0.1, columns=None):
         state_str = state_strs[i]
         au2ev = 27.2114079527
         ee = float((data['e'][i] - data['e'].min()).real * au2ev)
-        var = float((data['e2'][i] - data['e'][i]**2).real) if 'e2' in data else np.nan
+        var = float((data[e2][i] - data['e'][i]**2).real) if e2 in data else np.nan
         ei = data['e'][i].real
-        row = f'{i:>02} | {ei:>14.9f} | {var.real:>12.9f} '
+        row = f'{i:>02} | {ei:>14.9f} | {var.real:>13.9f} ' + (f'| {float(data["sz"][i].real):>6.3f} ' if sz else '')
         column_index = 0
         for v in values:
             for x in v:
@@ -91,8 +95,6 @@ def compute_data(data, c, postprocess_data, key='_full_degenerate_diag', *, save
         for name, matrix in data.items():
             matrix = np.asarray(matrix)
             if not np.isfinite(matrix).all():
-                if name == 'e2':
-                    continue
                 raise ValueError(f"Nonfinite matrix elements for {name}")
             postprocess_data[name+"_matrix"+key] = (c.conj() @ matrix) @ c.T
 
@@ -195,17 +197,22 @@ def main():
     for fname in args.out:
         print()
         print(fname)
-        _, _, _, xyzstr, basis, _, _, _, data, cart, _ = load_h5(fname, jax_arrays=False)
+        _, _, _, xyzstr, basis, _, _, extra_data, data, cart, _ = load_h5(fname, jax_arrays=False)
+        nstates = int(extra_data.get("nstates", 1))
         table2, is_linear = symmetry_table(data, xyzstr, basis, cart=cart)
         if table2 is None:
             raise ValueError(f"no character table available for {fname}")
 
-        matrices = state_matrices(data, "")
+        # the rotated states of sld-diagonalize-symm, if any
+        suffix = "" if nstates == 1 else "_full_degenerate_diag" if "c_full_degenerate_diag" in data else "_full"
+        matrices = state_matrices(data, suffix)
         if "o" not in matrices or "e" not in matrices:
             raise ValueError(f"{fname} has no state matrices, run sld-postprocess-symm on the optimization output first")
+        if nstates > 1:
+            print("rotated states" if suffix == "_full_degenerate_diag" else "states, not rotated (see sld-diagonalize-symm)")
 
-        values = state_values(matrices, np.eye(1))
-        print_states(1, values, table2, tol=args.tol)
+        values = state_values(matrices, np.eye(len(matrices["o"])))
+        print_states(nstates, values, table2, tol=args.tol)
         weights = projector_weights(values, table2, is_linear, args.max_lz)
         if weights is not None:
             print("\nspin and irrep projector weights:")

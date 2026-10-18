@@ -20,10 +20,10 @@ Energies are in Hartree, dipoles in atomic units, the `xyz` coordinates in Ångs
 | `Xsu`      | Complex128 | (n_determinants, n_electron_up, n_orb) | UHF determinants in the orthonormal basis, spin-up part |
 | `Xsd`      | Complex128 | (n_determinants, n_electron_down, n_orb) | UHF determinants in the orthonormal basis, spin-down part |
 | `Xs`       | Complex128 | (n_determinants, n_electron, 2 n_orb) | GHF determinants, replaces `Xsu` and `Xsd` |
-| `eigvals`  | Float64    | (n_steps,) | value of the loss at every step: the lowest eigenvalue of the generalized eigenvalue problem; includes the penalty term (`s2_loss`); with a projector (`project_*`) the projected energy ⟨Ψ\|Ĥ P̂\|Ψ⟩/⟨Ψ\|P̂\|Ψ⟩ |
+| `eigvals`  | Float64    | (n_steps,) | value of the loss at every step: the lowest eigenvalue of the generalized eigenvalue problem for the ground state, tr(S⁻¹H) over the states for excited states; includes the penalty terms (`s2_loss`, `symm_loss`); with a projector (`project_*`) the projected energy ⟨Ψ\|Ĥ P̂\|Ψ⟩/⟨Ψ\|P̂\|Ψ⟩ |
 | `mo_coeff` | Float64    | (n_orb, n_orb) | the orthonormal basis (not necessarily the Hartree-Fock orbitals) |
 
-The determinants are not normalized.
+The determinants are not normalized. For excited states the determinants are ordered by state, `nper` per state.
 
 ## Extra Group (`/extra`)
 
@@ -35,6 +35,8 @@ Settings of the optimization.
 | `charge` | total charge of the molecule (`--charge`), only for ions |
 | `ghf`, `real`, `nonorthogonal`, `dense_solver`, `particle_hole`, `orthogao`, `start`, `s2_loss` | options of the optimization |
 | `uhf_backend`, `hybrid_*`, `lanczos_*`, `static_spin_blocks`, `batch_size_hess` | options of the matrix element backend and the solver |
+| `nstates`, `nper`, `sweep`, `symm_loss`, `uniform_spin_count` | options of `sld-optimize-exc` (number of states, determinants per state, ...) |
+| `energy_vals` | energies of the states at every step, (n_steps, nstates), only `sld-optimize-exc` |
 | `partialopt` | option of `sld-optimize-partial`, number of determinants whose orbitals are optimized per step |
 | `project_spin`, `project_irrep`, `project_lz`, `linear_subgroup` | projector of `sld-optimize` (variation after projection); the determinants are those of \|Ψ⟩, the state is P̂\|Ψ⟩ |
 
@@ -42,7 +44,7 @@ Settings of the optimization.
 
 | Name | Description |
 |------|-------------|
-| `backend`, `nonorthogonal`, `skipvar`, `skipdip`, `load_integrals_mo`, `project_spin`, `projected_energy`, `projected_variance` | options of the postprocessing run that wrote the file (only those that apply to the script) |
+| `backend`, `nonorthogonal`, `skipvar`, `skipdip`, `load_integrals_mo`, `project_spin`, `projected_energy`, `projected_variance`, `trdm` | options of the postprocessing run that wrote the file (only those that apply to the script) |
 
 ### Ground state
 
@@ -56,21 +58,36 @@ Written by `sld-postprocess`.
 | `var_fc` | variance of the frozen-core Hamiltonian, for runs with frozen core orbitals |
 | `<op>_mels` | ⟨φ_i\|Ô\|φ_j⟩ for `o`, `e`, `e2`, `s2` (`e2_fc` for runs with frozen core orbitals) |
 
-### Symmetry
+### Excited states
 
-Written by `sld-postprocess-symm`, for the state |ψ⟩ = Σ_i |φ_i⟩ with |φ_i⟩ the normalized determinants.
+Written by `sld-postprocess-symm` and `sld-diagonalize-symm`. K is the size of the subspace, i.e. the number of states.
+The states are
 
-| Name | Description |
-|------|-------------|
-| `<op>` | ⟨ψ\|Ô\|ψ⟩ / ⟨ψ\|ψ⟩ |
-| `<op>_matrix` | ⟨ψ\|Ô\|ψ⟩, shape (1, 1) |
-| `<op>_mels` | ⟨φ_i\|Ô\|φ_j⟩ (with `--save_mels`) |
+    |ψ_a⟩ = Σ_i c_ai |φ_i⟩,   a = 0 … K-1
+
+with |φ_i⟩ the normalized determinants. For `_all` they are expanded in the optimized states |χ_b⟩ instead,
+
+    |ψ_a⟩ = Σ_b c_ab |χ_b⟩,   |χ_b⟩ = Σ_{i ∈ b} x_i |φ_i⟩
+
+with i ∈ b the `nper` determinants of state b and x_i the norm of the stored determinant i.
+
+| Name | Shape | Description |
+|------|-------|-------------|
+| `<op><suffix>` | (K,) | ⟨ψ_a\|Ô\|ψ_a⟩ / ⟨ψ_a\|ψ_a⟩ |
+| `<op>_matrix<suffix>` | (K, K) | ⟨ψ_a\|Ô\|ψ_b⟩ |
+| `<op>_mels` | (n_determinants, n_determinants) | ⟨φ_i\|Ô\|φ_j⟩ |
+| `c<suffix>` | (K, n_determinants) | c_ai; for `_all` c_ab, (K, K) |
+| `tmux<suffix>`, `tmuy<suffix>`, `tmuz<suffix>` | (K, K) | transition dipole moments ⟨ψ_a\|μ̂\|ψ_b⟩ between the normalized states |
+| `trdm<suffix>` | (2, K, K, n_orb, n_orb) | transition 1-RDMs, `trdm[s, a, b, p, q]` = ⟨ψ_a\|ĉ†_ps ĉ_qs\|ψ_b⟩ between the normalized states, in the `mo_coeff` basis, s = up, down; a = b is the 1-RDM of each state |
+| `rotation_full_degenerate_diag` | (K, K) | unitary U from the `_full` states ψ to the `_full_degenerate_diag` states ψ', \|ψ'_a⟩ = Σ_b U_ab \|ψ_b⟩, so `c_full_degenerate_diag` = U `c_full`; it only mixes (near) degenerate states, so that Ŝ², L̂z or the point group are diagonal among them |
 
 | `<op>` | Ô |
 |--------|----------|
 | `o` | 1̂ (identity), the keys hold the overlaps |
 | `e`, `e2` | Ĥ, Ĥ² |
+| `e2_fc` | Ĥ_fc², with Ĥ_fc the frozen-core Hamiltonian; replaces `e2` for runs with frozen core orbitals |
 | `s2` | Ŝ² |
+| `sz` | Ŝz |
 | `lz` | L̂z (linear molecules) |
 | `mux`, `muy`, `muz` | dipole μ̂ |
 | `E`, `C_2`, `sigma_v(0)`, ... | point-group operation ĝ |
@@ -78,13 +95,20 @@ Written by `sld-postprocess-symm`, for the state |ψ⟩ = Σ_i |φ_i⟩ with |φ
 | `PS<S>_PLz<i>_<g>` | P̂_S ĝ exp(-iθ_i L̂z), θ_i = 2π i / N, i = 0 … N-1 (linear molecules, see below) |
 | `hp_<op>`, `h2p_<op>` | ĤÔ and Ĥ²Ô for the two above, for the projected energies and variances |
 
+| `<suffix>` | States |
+|------------|--------|
+| (none) | single state |
+| `_all` | the optimized states rediagonalized among themselves, Σ_b H_ab v_b = E Σ_b S_ab v_b in the span of the K optimized states |
+| `_full` | the K lowest solutions of Σ_j H_ij c_j = E Σ_j S_ij c_j, with H_ij = ⟨φ_i\|Ĥ\|φ_j⟩ and S_ij = ⟨φ_i\|φ_j⟩ over all determinants |
+| `_full_degenerate_diag` | `_full` rotated by `sld-diagonalize-symm`, \|ψ'_a⟩ = Σ_b U_ab \|ψ_b⟩ |
+
 ### Point group and character table
 
-The point group of the molecule. The weight of irrep Γ in the state is ⟨ψ|P̂_Γ|ψ⟩ / ⟨ψ|ψ⟩, with
+The point group of the molecule, the same for all states. The weight of irrep Γ in state a is ⟨ψ_a|P̂_Γ|ψ_a⟩ / ⟨ψ_a|ψ_a⟩, with
 
     P̂_Γ = Σ_g w_Γg ĝ
 
-computed from the `<g>` keys above.
+computed from the `<g><suffix>` keys above.
 
 | Name | Type | Shape | Description |
 |------|------|-------|-------------|
