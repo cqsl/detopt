@@ -72,7 +72,7 @@ def eigsh(a, k=6, *, which="LM", v0=None, ncv=None, maxiter=None, tol=None, retu
 
     alpha = jnp.zeros((ncv,), dtype=dtype)
     beta = jnp.zeros((ncv,), dtype=dtype.char.lower())
-    V = jnp.empty((ncv, n), dtype=dtype)
+    V = jnp.zeros((ncv, n), dtype=dtype)
 
     # Set initial vector
     if v0 is None:
@@ -130,8 +130,6 @@ def eigsh(a, k=6, *, which="LM", v0=None, ncv=None, maxiter=None, tol=None, retu
         return V, u, alpha, beta, beta_k, x, res, iter_, w
 
     *_, x, res, iter, w = jax.lax.while_loop(cond_fun, body_fun, (V, u, alpha, beta, beta_k, x, res, iter_, w))
-
-    # TODO return info with res and iter
 
     if return_eigenvectors:
         idx = jnp.argsort(w)
