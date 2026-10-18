@@ -2,10 +2,10 @@ from functools import partial
 from ._impl import Impl
 from jax.tree_util import Partial
 
-from ._src.hand_optimized.derivatives_uhf import hess, hess_spin, grad_spin
+from ._src.pairwise.derivatives_uhf import hess, hess_spin, grad_spin
 
-from ._src.hand_optimized import stable as stable_
-from ._src.hand_optimized import unstable as unstable_
+from ._src.pairwise import stable as stable_
+from ._src.pairwise import unstable as unstable_
 
 from ._src.integrate import integrate
 
