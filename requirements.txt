@@ -1,0 +1,14 @@
+# versions used for the paper, python 3.14
+# pip install -r requirements.txt && pip install .
+# on gpu use jax[cuda12]==0.11.2 instead of jax and jaxlib
+jax==0.11.2
+jaxlib==0.11.2
+flax==0.12.10
+numpy==2.5.4
+scipy==1.18.1
+h5py==3.16.0
+pyscf==2.14.0
+tqdm==4.70.1
+ipython==9.13.0
+qcelemental==0.50.4
+molsym @ git+https://github.com/NASymmetry/MolSym.git@178e0290faadc9bc2b32247b74ca9da041d760db

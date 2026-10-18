@@ -1,215 +1,205 @@
+from sld.scripts._env import setup_jax
+
+setup_jax()
+
 import jax
-
-jax.config.update("jax_enable_x64", True)
-
-from jax.sharding import Mesh, set_mesh, AxisType, reshard
-
-mesh = Mesh(jax.devices(), "i", AxisType.Explicit)
-set_mesh(mesh)
-
 import jax.numpy as jnp
 
 import argparse
 
 import numpy as np
 
-from tqdm.auto import tqdm
-
-from sld.utils.hamiltonian import orbitals_pyscf, prepare_hamiltonian, ao2mo
-from sld.utils.io import save_h5, load_h5
-from sld.mels import compute_mels, get_impls
-
-from functools import partial
+from sld.utils.hamiltonian import orbitals_pyscf, prepare_hamiltonian, ao2mo, particle_hole_trafo, freeze_core
+from sld.utils.hamiltonian.orb_conversion import spinorb_one_body
+from sld.utils.io import record_settings, save_h5, load_h5
+from sld.mels import get_impls
 
 from sld.slater import USSD, GSSD
 
+from sld.scripts._helpers import add_backend_args, compute_postprocess_mels, s2_arrays, positive_int, POSTPROCESS_SETTINGS
 
-@jax.jit
-@partial(jax.vmap, in_axes=(None, 0, 0, None))
-def v_eval(f, Xi, Yj, arrays):
-    if isinstance(Xi.nelec, tuple):
-        return f(Xi.Xu.conj(), Xi.Xd.conj(), Yj.Xu, Yj.Xd, hamiltonian=arrays)
+def add_common_args(parser):
+    parser.add_argument("out", type=str, nargs="+", help=".h5 files containing the simulation output (supports one or more different simulations)")
+    parser.add_argument("--batch_size", type=positive_int, required=False, help="how many mels to compute in parallel (max); set this if you get OOM errors")
+    parser.add_argument("--load_integrals_mo", nargs=3, required=False, help="npy files for precomputed enuc, h1e_mo, h2e_mo (optional, the default is to compute the integrals with pyscf)")
+    parser.add_argument("--skipvar", action="store_true", help="skip computation of ⟨H²⟩")
+    parser.add_argument("--nonorthogonal", action="store_true", help="use faster non-svd code; requires non-orthogonal determinants")
+    parser.add_argument("--batch_size_var", type=positive_int, required=False, help="how many mels for <H^2> to compute in parallel (max); defaults to --batch_size; set this if you get OOM errors")
+    parser.add_argument("--save_mels", action="store_true", help="also save the full determinant-space matrix elements")
+    parser.add_argument("--progress", choices=("auto", "on", "off"), default="auto", help="show progress per block (default: when stderr is a terminal)")
+    parser.add_argument("--triangular", action=argparse.BooleanOptionalAction, default=True, help="compute only the upper triangle and mirror it (default: on)")
+    parser.add_argument("--triangular_groups", type=positive_int, default=8, help="number of bra groups for the triangle (default: 8)")
+    return parser
+
+def frozen_core(Xs, nfreeze):
+    # with frozen core orbitals the variance is that of the frozen-core hamiltonian (UHF only)
+    return bool(nfreeze) and isinstance(Xs, tuple)
+
+
+def load(fname, args, symmetry=True, impls=None, ghf_hamiltonian=False, frozen=None):
+    # frozen: use the frozen-core hamiltonian on the active orbitals, default frozen_core(...); otherwise the frozen orbitals are added back
+    Xs_start, mo_coeff, eigvals, xyzstr, basis, spin, name, extra_data, _postprocess_data_old, cart, nfreeze = load_h5(fname)
+    frozen_core_variance = frozen_core(Xs_start, nfreeze) if frozen is None else frozen
+    if frozen_core_variance and nfreeze % 2:
+        raise ValueError("the frozen-core hamiltonian needs an even nfreeze")
+
+    if isinstance(Xs_start, tuple):
+        coeffs_start = jnp.ones(Xs_start[0].shape[0], dtype=Xs_start[0].dtype)
+        X = USSD(*Xs_start, coeffs_start).normalize_orbs()
     else:
-        return f(Xi.X.conj(), Yj.X, hamiltonian=arrays)
+        coeffs_start = jnp.ones(Xs_start.shape[0], dtype=Xs_start.dtype)
+        X = GSSD(Xs_start, coeffs_start).normalize_orbs()
 
+    X_orig = Xs_start
 
-def compute_in_blocks(f, X, Y=None, n_results=None, batch_size=None, arrays=None, hermitian=False):
-    if batch_size is None:
-        return compute_mels(f, X, Y, arrays=arrays, batch_size=None)
-    assert n_results is not None
-    ndetx = X.ndet
-    if Y is not None:
-        hermitian = False
+    ghf = not isinstance(X.nelec, tuple)
+
+    # loading pre-computed coefficients directly
+    if args.load_integrals_mo is not None:
+        enuc = np.load(args.load_integrals_mo[0])
+        h1e_mo = np.load(args.load_integrals_mo[1])
+        h2e_mo = np.load(args.load_integrals_mo[2])
+        particle_hole = False
+        nao = h1e_mo.shape[0]
+        nelec = X.nelec
+        if nfreeze is not None:
+            nelec = tuple(n + nfreeze // 2 for n in X.nelec)
+        dip_mo, angmom_mo, mol = [], [], None
     else:
-        Y = X
-    ndety = Y.ndet
-    dtype = X.dtype
+        if np.isnan(mo_coeff).any():
+            raise ValueError("mo_coeff not found, please load integrals manually with --load_integrals_mo")
+        nao, nelec, _, enuc, h1e_ao, h2e_ao, dip_ao, angmom_ao, mol = orbitals_pyscf(xyzstr, basis, spin, mo_coeff=mo_coeff, cart=cart, symmetry=symmetry, charge=int(extra_data.get("charge", 0)))
+        h1e_mo = ao2mo(h1e_ao, mo_coeff)
+        h2e_mo = ao2mo(h2e_ao, mo_coeff)
+        del h1e_ao
+        del h2e_ao
+        dip_mo = [ao2mo(di, mo_coeff) for di in dip_ao]
+        angmom_mo = [ao2mo(ai, mo_coeff) for ai in angmom_ao]
 
-    res = tuple(np.zeros((ndetx, ndety), dtype=dtype) for _ in range(n_results))
-    if hermitian:
-        ijs = np.array(list(zip(*np.triu_indices(ndetx))))
+    if nfreeze is None:
+        nelec_expected = tuple(nelec) if ghf else X.nelec
+        particle_hole = (sum(nelec) if ghf else nelec) != X.nelec
     else:
-        ijs = np.array(list(np.ndindex(ndetx, ndety)))
+        # no particle hole supported when using frozen core
+        particle_hole = False
+        nelec_expected=nelec
 
-    n = len(ijs)
-    # if batch_size is None:
-    #     batch_size = n
-    #     m = 1
-    #     rest = 0
-    # else:
-    #     m, rest = divmod(n, batch_size)
-    m, rest = divmod(n, batch_size)
+    if particle_hole:
+        print('using particle-hole transformation')
 
-    if rest > 0:
-        ijs_main = ijs[:-rest]
-        ijs_rest = ijs[-rest:]
+    if frozen_core_variance:
+        ncore = nfreeze // 2
+        if h1e_mo.shape != (X.Xu.shape[-1] + ncore,) * 2:
+            raise ValueError("the frozen-core hamiltonian needs the full MO integrals including the frozen core")
+        print("frozen core data; computing variance with the frozen-core effective Hamiltonian")
+        enuc, h1e_mo, h2e_mo = freeze_core(enuc, h1e_mo, h2e_mo, nfreeze=nfreeze)
+        nao = X.Xu.shape[-1]
+        nelec_expected = X.nelec
+
+    spin_orbital = ghf or ghf_hamiltonian
+    hamiltonian = prepare_hamiltonian(
+        enuc, h1e_mo, h2e_mo, spin_orbital, particle_hole=particle_hole,
+        ghf_keepspin=spin_orbital and args.backend != "pairwise",
+    )
+
+    if "energy_vals" in extra_data.keys():
+        if extra_data["energy_vals"][:].nbytes > 1000000:
+            print("removing energy vals from the dataset to save space")
+            del extra_data["energy_vals"]
+
+    if impls is None:
+        impls = get_impls(ghf, args.nonorthogonal)
+
+    if particle_hole:
+        arrays_dip_mo = [dict(zip(['Enuc', 'H1e'], particle_hole_trafo(0, di, None)[:2])) for di in dip_mo]
+        arrays_angmom_mo = [dict(zip(['Enuc', 'H1e'], particle_hole_trafo(0, ai, None)[:2])) for ai in angmom_mo]
+    elif frozen_core_variance:
+        def frozen_one_body(di):
+            return {'Enuc': 2 * jnp.trace(di[:ncore, :ncore]), 'H1e': di[ncore:, ncore:]}
+        arrays_dip_mo = [frozen_one_body(di) for di in dip_mo]
+        arrays_angmom_mo = [frozen_one_body(ai) for ai in angmom_mo]
     else:
-        ijs_main = ijs
-        ijs_rest = None
+        one_body = spinorb_one_body if ghf else (lambda x: x)
+        arrays_dip_mo = [{'H1e': one_body(di)} for di in dip_mo]
+        arrays_angmom_mo = [{'H1e': one_body(ai)} for ai in angmom_mo]
+    del dip_mo
+    del angmom_mo
 
-    for ij in tqdm(ijs_main.reshape(m, batch_size, 2)):
-        i, j = ij.T
-        Xi = X[i]
-        Yj = Y[j]
-        Xi = reshard(Xi, jax.P("i"))
-        Yj = reshard(Yj, jax.P("i"))
-        vals = v_eval(f, Xi, Yj, arrays)
-        vals = reshard(vals, jax.P())
-        for k in range(n_results):
-            res[k][i, j] = np.array(vals[k][:, 0, 0])
-            if hermitian:
-                res[k][j, i] = np.array(vals[k][:, 0, 0].T.conj())
+    if nfreeze is not None and not frozen_core_variance:
+        print("frozen core data; adding frozen orbitals back to the state")
+        X = X.unfreeze(nfreeze // 2, nfreeze // 2)
 
-    if ijs_rest is not None:
-        i, j = ijs_rest.T
-        Xi = X[i]
-        Yj = Y[j]
-        vals = v_eval(f, Xi, Yj, arrays)
-        for k in range(n_results):
-            res[k][i, j] = np.array(vals[k][:, 0, 0])
-            if hermitian:
-                res[k][j, i] = np.array(vals[k][:, 0, 0].T.conj())
-    return tuple(map(jnp.array, res))
+    return impls, X, hamiltonian, nelec_expected, nao, (X_orig, mo_coeff, eigvals, xyzstr, basis, spin, name, extra_data, cart, arrays_dip_mo, arrays_angmom_mo, mol, _postprocess_data_old, nfreeze)
 
+
+def print_standard(expvals, eigvals=[None]):
+    energy = expvals['e']
+    s2 = expvals['s2']
+    s = np.sqrt(s2.real + 0.25) - 0.5
+    print()
+    print("eigval: ", eigvals[-1])
+    print()
+    print("<H>   : ", energy.real)
+    if 'e2' in expvals:
+        print("<H^2> : ", expvals['e2'].real)
+        print("var   : ", (expvals['e2'] - energy**2).real)
+
+    print(f"<S2>  : {float(s2.real):0.6f}")
+    print(f"S     : {float(s.real):0.6f}")
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("out", type=str, nargs="+", help=".h5 files containing the simulation output (supports one or more different simulations)")
-    parser.add_argument("--batch_size", type=int, required=False, help="how many mels to compute in parallel (max); set this if you get OOM errors")
+    add_common_args(parser)
+    add_backend_args(parser)
     parser.add_argument("--verify", action="store_true", help="re-compute existing postprocessed energies and verify them for correctness")
-    parser.add_argument("--load_integrals_mo", nargs=3, required=False, help="npy files for prec-computed enuc, h1e_mo, h2e_mo (optional, the default is to compute the integrals with pyscf)")
-    parser.add_argument("--skipvar", action="store_true", help="skip compuattion of ⟨H²⟩")
-    parser.add_argument("--nonorthogonal", action="store_true", help="use faster non-svd code; requires non-orthogonal determinants")
-
-    parser.add_argument("--save_mels", action="store_true", help="store matrix elements in output file for future postprocessing")
-
-    # this always uses the svd version (for now)
-
     args = parser.parse_args()
 
     for fname in args.out:
         print()
         print(fname)
 
-        Xs_start, mo_coeff, eigvals, xyzstr, basis, spin, name, extra_data, _postprocess_data_old, cart, _ = load_h5(fname)
-
-        if isinstance(Xs_start, tuple):
-            coeffs_start = jnp.ones(Xs_start[0].shape[0], dtype=Xs_start[0].dtype)
-            X = USSD(*Xs_start, coeffs_start).normalize_orbs()
-        else:
-            coeffs_start = jnp.ones(Xs_start.shape[0], dtype=Xs_start.dtype)
-            X = GSSD(Xs_start, coeffs_start).normalize_orbs()
-
-        X_orig = Xs_start
-
-        ghf = not isinstance(X.nelec, tuple)
-
-        # loading pre-computed coefficients directly
-        if args.load_integrals_mo is not None:
-            enuc = np.load(args.load_integrals_mo[0])
-            h1e_mo = np.load(args.load_integrals_mo[1])
-            h2e_mo = np.load(args.load_integrals_mo[2])
-            particle_hole = False
-            nao = h1e_mo.shape[0]
-            nelec = X.nelec # TODO particle-hole
-        else:
-            if np.isnan(mo_coeff).any():
-                raise ValueError('mo_coeff not found, please load integrals manually with --load_integrals_mo')
-            nao, nelec, _, enuc, h1e_ao, h2e_ao, dip_ao, angmom_ao, mol = orbitals_pyscf(xyzstr, basis, spin, mo_coeff=mo_coeff, cart=cart, symmetry=True)
-            h1e_mo = ao2mo(h1e_ao, mo_coeff)
-            h2e_mo = ao2mo(h2e_ao, mo_coeff)
-            del h1e_ao
-            del h2e_ao
-
-        nelec_expected = X.nelec
-        particle_hole = nelec != nelec_expected
-
-        hamiltonian = prepare_hamiltonian(enuc, h1e_mo, h2e_mo, ghf, particle_hole=particle_hole)
-
-        if "energy_vals" in extra_data.keys():
-            if extra_data["energy_vals"][:].nbytes > 1000000:
-                print("removing energy vals from the dataset to save space")
-                del extra_data["energy_vals"]
-
-        impls = get_impls(ghf, args.nonorthogonal, False)
-        expval = impls.expval
-        expval_sq = impls.expval_sq
+        impls, X, hamiltonian, nelec_expected, nao, (X_orig, mo_coeff, eigvals, xyzstr, basis, spin, name, extra_data, cart, arrays_dip_mo, arrays_angmom_mo, mol, _postprocess_data_old, nfreeze) = load(fname, args)
+        fc = frozen_core(X_orig, nfreeze)
+        var_key = 'var_fc' if fc else 'var'
+        if args.verify and ('var' if fc else 'var_fc') in _postprocess_data_old:
+            raise ValueError("frozen-core and full-Hamiltonian variances differ")
 
         X = X.normalize_dets()
-        nn = X.coeffs
+        c = X.coeffs
+
+        data = {}
         postprocess_data = {}
-        if True:
-            if args.skipvar:
-                print("computing energy")
-                oo, ee = compute_in_blocks(expval, X, n_results=2, batch_size=args.batch_size, arrays=hamiltonian, hermitian=True)
-                vv = np.full_like(ee, fill_value=jnp.inf)
-            else:
-                print("computing energy and variance")
-                oo, vv, ee = compute_in_blocks(expval_sq, X, n_results=3, batch_size=args.batch_size, arrays=hamiltonian, hermitian=True)
+        if args.skipvar:
+            print("computing energy")
+            data['o'], data['e'] = compute_postprocess_mels(impls, X, hamiltonian, args, label="H")
+        else:
+            print("computing energy and variance")
+            data['o'], data['e2'], data['e'] = compute_postprocess_mels(impls, X, hamiltonian, args, squared=True, label="H^2")
 
-            print("computing S^2")
-            N_u, N_d = nelec_expected
-            arrays_s2 = None, None, 0.5 * (N_u + N_d) + 0.25 * (N_u - N_d) * (N_u - N_d), -jnp.einsum("ij,ab->iabj", jnp.eye(nao), jnp.eye(nao))
-            _, ss = compute_in_blocks(expval, X, n_results=2, arrays=arrays_s2, batch_size=args.batch_size, hermitian=True)
+        print("computing S^2")
+        _, data['s2'] = compute_postprocess_mels(impls, X, s2_arrays(X, nelec_expected, nao), args, label="S^2")
 
-            ndet = len(nn)
-            oo, ee, vv, ss = jax.tree.map(lambda x: x.reshape(ndet, ndet), (oo, ee, vv, ss))
+        # flatten
+        ndet = len(c)
+        data = jax.tree.map(lambda x: x.reshape(ndet, ndet), data)
 
-            if args.save_mels:
-                # save matrix elements for further postprocessing
-                postprocess_data["oo_mels"] = np.array(oo)
-                postprocess_data["ee_mels"] = np.array(ee)
-                postprocess_data["vv_mels"] = np.array(vv)
-                postprocess_data["ss_mels"] = np.array(ss)
+        if args.save_mels:
+            # save matrix elements for further postprocessing
+            for k, v in data.items():
+                postprocess_data[("e2_fc" if k == "e2" and fc else k) + "_mels"] = np.array(v)
 
-        if True:
-            denom = nn.T.conj() @ oo @ nn
-            energy = nn.T.conj() @ ee @ nn / denom
-            energy_sq = nn.T.conj() @ vv @ nn / denom
-            s2 = nn.T.conj() @ ss @ nn / denom
-            variance = energy_sq - energy**2
+        denom = c.T.conj() @ data['o'] @ c
+        expvals = jax.tree.map(lambda x: c.T.conj() @ x @ c / denom, data)
+        print_standard(expvals, eigvals=eigvals)
 
-            print()
-            print("eigval: ", eigvals[-1])
-            if "s2_vals" in extra_data.keys():
-                print("s2: ", extra_data["s2_vals"][-1].real)
-                if "s2_loss" in extra_data:
-                    print("Energy: ", eigvals[-1] - extra_data["s2_loss"] * extra_data["s2_vals"][-1].real)
-            print()
-            print("<H>   : ", energy.real)
-            print("<H^2> : ", energy_sq.real)
-            print("var   : ", variance.real)
-
-            s = np.sqrt(s2.real + 0.25) - 0.5
-            print(f"<S2>  : {s2.real:0.6f}")
-            print(f"S     : {s:0.6f}")
-            postprocess_data = {"s2": s2, "e": energy, "var": variance}
+        postprocess_data['e'] = np.array(expvals['e'])
+        if 'e2' in expvals:
+            postprocess_data[var_key] = np.array(expvals['e2'] - expvals['e']**2)
+        postprocess_data['s2'] = np.array(expvals['s2'])
 
         if args.verify:
             for k in postprocess_data.keys():
                 print(k)
-                if k == 'var' and args.skipvar:
-                    continue
                 try:
                     np.testing.assert_allclose(_postprocess_data_old[k], postprocess_data[k], atol=1e-13)
                     print("ok", _postprocess_data_old[k] - postprocess_data[k])
@@ -218,8 +208,8 @@ def main():
             continue
 
         fname_out = fname.replace(".h5", "_var.h5")
-        save_h5(fname_out, X_orig, mo_coeff, eigvals, xyzstr, basis, spin, name, extra_data=extra_data, postprocess_data=postprocess_data, cart=cart)
-
+        record_settings(postprocess_data, args, POSTPROCESS_SETTINGS)
+        save_h5(fname_out, X_orig, mo_coeff, eigvals, xyzstr, basis, spin, name, extra_data=extra_data, postprocess_data=postprocess_data, cart=cart, nfreeze=nfreeze)
 
 if __name__ == "__main__":
     main()
