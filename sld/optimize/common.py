@@ -14,19 +14,17 @@ def integrate_and_assemble_all(v0_full_normalized, Sff, Hff, Sfl, Hfl, Sll, Hll,
     if sum_f:
         # sum over all dets representing a single state
         ab = "b"
-        ab2 = ""
         idx = None
-        idx2 = None, None
+        Sff = jnp.asarray(Sff, dtype=Sfl.dtype)[None, None]
+        Hff = jnp.asarray(Hff, dtype=Sfl.dtype)[None, None]
     else:
-        ab = ab2 = "ab"
-        idx = idx2 = Ellipsis
+        ab = "ab"
+        idx = Ellipsis
     # match the sharding of the determinant axes of each operator, the results are replicated anyway
     v = lambda M, axis: reshard(v0_full_normalized, P(jax.typeof(M).sharding.spec[axis]))
     # x is a dummy dimension
     Sfl = jnp.einsum(f"aibx,ai->{ab}", Sfl, v(Sfl, 0).conj(), out_sharding=P())[idx]
     Hfl = jnp.einsum(f"aibx,ai->{ab}", Hfl, v(Hfl, 0).conj(), out_sharding=P())[idx]
-    Sff = jnp.einsum(f"aibj,ai,bj->{ab2}", Sff, v(Sff, 0).conj(), v(Sff, 2), out_sharding=P())[idx2]
-    Hff = jnp.einsum(f"aibj,ai,bj->{ab2}", Hff, v(Hff, 0).conj(), v(Hff, 2), out_sharding=P())[idx2]
     Sll = jax.lax.collapse(jax.lax.collapse(Sll, 0, 2), 1, 3)
     Hll = jax.lax.collapse(jax.lax.collapse(Hll, 0, 2), 1, 3)
 

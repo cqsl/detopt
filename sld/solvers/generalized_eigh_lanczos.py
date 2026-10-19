@@ -60,20 +60,21 @@ def _project_excited_effective_matrices(HH, SS, T, G, S_fixed, H_fixed, ne):
     T_right = reshard(T, jax.P()) if row_sharded else T
     right = jnp.concatenate([Z, G], axis=1)
     right = reshard(right, jax.P()) if row_sharded else right
-    B = B - jnp.matmul(Q, T_right.T.conj(), out_sharding=jax.typeof(B).sharding)
+    B = B + jnp.matmul(-Q, T_right.T.conj(), out_sharding=jax.typeof(B).sharding)
     R = Q @ H_fixed - G
     left = jnp.concatenate([R, -Q], axis=1)
     A = A + jnp.matmul(left, right.T.conj(), out_sharding=jax.typeof(A).sharding)
     shift = jnp.einsum("ij,ji->", S_inv, H_fixed).real
-    return A, B, Pl, shift
+    return A, B, Pl, shift, (Q, T_right, left, right)
 
 
 @partial(jax.jit, static_argnames=("nelec", "k", "precomp", "ncv", "tol"))
 def generalized_eigh_cholesky_lanczos_exc_tensor(HH, SS, T, G, S_fixed, H_fixed, nelec, k=1, ncv=255, x0=None, key=None, precomp=True, spin=None, tol=None):
+    # also returns (v^† SS v, v^† HH v)
     ne, reg_mask = projection_rank(HH.shape[1], nelec, spin)
-    A, B, P, shift = _project_excited_effective_matrices(HH, SS, T, G, S_fixed, H_fixed, ne)
+    A, B, P, shift, (Q, T_right, left, right) = _project_excited_effective_matrices(HH, SS, T, G, S_fixed, H_fixed, ne)
 
-    B = regularize(reshard(B, jax.P()), reg_mask)
+    B, reg = regularize(reshard(B, jax.P()), reg_mask)
     L = jax.lax.linalg.cholesky(B, symmetrize_input=False)
 
     if x0 is not None:
@@ -87,10 +88,21 @@ def generalized_eigh_cholesky_lanczos_exc_tensor(HH, SS, T, G, S_fixed, H_fixed,
     e0, v0, info = eigsh(C, which="SA", k=k, ncv=ncv, tol=tol, dtype=A.dtype, shape=A.shape, v0=x0, key=key)
 
     e0 = e0[:1] + shift
-    v0 = v0.T[:1]
-    v0 = postprocess(v0, P, L=L)
+    y = v0.T[0]
+    v0 = postprocess(v0.T[:1], P, L=L)
     v0 = reshard(v0, jax.P())
-    return e0, v0, info[1]
+
+    # v = P w, w = L^-† y
+    w = jax.lax.linalg.triangular_solve(L, y[:, None], left_side=True, lower=True, transpose_a=True, conjugate_a=True)[:, 0]
+    wQ = reshard(Q, jax.P()).T.conj() @ w
+    wT = reshard(T_right, jax.P()).T.conj() @ w
+    wl = reshard(left, jax.P()).T.conj() @ w
+    wr = reshard(right, jax.P()).T.conj() @ w
+    s = (y.conj() @ y).real + (wQ.conj() @ wT).real
+    if reg is not None:
+        s = s - (w.conj() * reg * w).sum().real
+    h = (y.conj() @ C(y)).real - (wl.conj() @ wr).real
+    return e0, v0, info[1], (s, h)
 
 
 @partial(jax.jit, static_argnames=("nelec"))
@@ -110,7 +122,7 @@ def generalized_eigh_cholesky_decomp_tensor(U, S, nelec, spin=None):
 
     # the Cholesky factorization runs on a single device
     S = reshard(S, jax.P())
-    S = regularize(jax.lax.collapse(jax.lax.collapse(S, 0, 2), 1, 3), reg_mask)
+    S, _ = regularize(jax.lax.collapse(jax.lax.collapse(S, 0, 2), 1, 3), reg_mask)
     L = jax.lax.linalg.cholesky(S, symmetrize_input=False)
 
     U = jax.lax.collapse(U, 0, 2)

@@ -148,7 +148,7 @@ def optimize_step_exc(
 
     if cholesky:
         x0_opt = X_opt.get_orbitals_weighted()
-        e, v_opt, info = generalized_eigh_cholesky_lanczos_exc_tensor(HH, SS, T, G, S, H, nelec=X_opt.nelec, ncv=lanczos_ncv, tol=lanczos_tol, x0=x0_opt, spin=getattr(X_opt, "s", None))
+        e, v_opt, info, (normsq_opt, h_opt) = generalized_eigh_cholesky_lanczos_exc_tensor(HH, SS, T, G, S, H, nelec=X_opt.nelec, ncv=lanczos_ncv, tol=lanczos_tol, x0=x0_opt, spin=getattr(X_opt, "s", None))
     else:
         raise NotImplementedError("--dense_solver")
 
@@ -156,7 +156,6 @@ def optimize_step_exc(
     v0_opt = v_opt[0]
 
     # normalize the new state
-    normsq_opt = jnp.einsum("aibj,ai,bj", SS, v0_opt.conj(), v0_opt)
     v0_opt_normalized = v0_opt * jax.lax.rsqrt(normsq_opt)
     # normalize the orbitals
     coeffs_opt = jnp.linalg.norm(v0_opt_normalized, axis=1)
@@ -170,7 +169,7 @@ def optimize_step_exc(
 
     # concatenate
     X = X_opt + X_fix
-    S_all, H_all = integrate_and_assemble_all(v0_opt_normalized, SS, HH, T[..., None], G[..., None], S[:, None, :, None], H[:, None, :, None], sum_f=True)
+    S_all, H_all = integrate_and_assemble_all(v0_opt_normalized, 1.0, h_opt / normsq_opt, T[..., None], G[..., None], S[:, None, :, None], H[:, None, :, None], sum_f=True)
 
     if keep_order:
         # restore original ordering

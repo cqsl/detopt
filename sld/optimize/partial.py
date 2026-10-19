@@ -112,6 +112,8 @@ def optimize_step_partial(
 
     # concatenate
     X = Xf + Xl
+    Sff = jnp.einsum("aibj,ai,bj->ab", Sff, reshard(v0f, P(jax.typeof(Sff).sharding.spec[0])).conj(), reshard(v0f, P(jax.typeof(Sff).sharding.spec[2])), out_sharding=P())
+    Hff = jnp.einsum("aibj,ai,bj->ab", Hff, reshard(v0f, P(jax.typeof(Hff).sharding.spec[0])).conj(), reshard(v0f, P(jax.typeof(Hff).sharding.spec[2])), out_sharding=P())
     S_all, H_all = integrate_and_assemble_all(v0f, Sff, Hff, Sfl, Hfl, Sll, Hll)
 
     return X, e0, info, S_all, H_all

@@ -23,9 +23,10 @@ def projection_rank(norb, nelec, spin):
 
 def regularize(B, reg_mask):
     if reg_mask is None:
-        return B
+        return B, None
     scale = jnp.maximum(1.0, jnp.abs(B).max())
-    return B + jnp.diag(jnp.where(reg_mask, 0.0, 1e8 * scale))
+    reg = jnp.where(reg_mask, 0.0, 1e8 * scale)
+    return B + jnp.diag(reg), reg
 
 
 @partial(jax.jit, static_argnames=("ne", "trafo"))
@@ -36,7 +37,7 @@ def preprocess_cholesky(H, S, ne, trafo=True, reg_mask=None):
     B = jax.lax.collapse(jax.lax.collapse(B, 0, 2), 1, 3)
 
     # gather all of it and run cholesky serially
-    B = regularize(reshard(B, jax.P()), reg_mask)
+    B, _ = regularize(reshard(B, jax.P()), reg_mask)
     L = jax.lax.linalg.cholesky(B, symmetrize_input=False)
     if not trafo:
         return A, P, L
@@ -52,7 +53,7 @@ def postprocess(v, P, *, L=None, Linv=None, n=None):
     if Linv is not None:
         v = jnp.einsum("ij,nj->ni", Linv, v)
     else:
-        v = jax.lax.linalg.triangular_solve(L, v, lower=True, conjugate_a=True)
+        v = jax.lax.linalg.triangular_solve(L, v.T, left_side=True, lower=True, transpose_a=True, conjugate_a=True).T
     if P is None:
         return v.reshape(v.shape[0], -1, n)
     v = v.reshape(-1, P.shape[0], P.shape[2])
