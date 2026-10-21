@@ -35,12 +35,13 @@ def integrate_and_assemble_all(v0_full_normalized, Sff, Hff, Sfl, Hfl, Sll, Hll,
     return S_all, H_all
 
 
-def expval_blocks(impls, X, hamiltonian, batch_size, backend, rcond, max_degree, factorization, cached_batch_size, pair_batch_size):
+def expval_blocks(impls, X, hamiltonian, batch_size, backend, rcond, max_degree, factorization, cached_batch_size, pair_batch_size, Y=None):
+    Y = X if Y is None else Y
     if backend in ("hybrid", "hybrid_svd"):
         if jax.device_count() == 1:
-            S, H = hybrid_uhf.expval(X, X, arrays=hamiltonian, rcond=rcond, max_degree=max_degree, factorization=factorization, cached_batch_size=cached_batch_size, pair_batch_size=pair_batch_size)
+            S, H = hybrid_uhf.expval(X, Y, arrays=hamiltonian, rcond=rcond, max_degree=max_degree, factorization=factorization, cached_batch_size=cached_batch_size, pair_batch_size=pair_batch_size)
         else:
-            S, H = hybrid_uhf.expval_sharded(reshard(X, P("i")), X, arrays=hamiltonian, rcond=rcond, max_degree=max_degree, factorization=factorization, cached_batch_size=cached_batch_size, pair_batch_size=pair_batch_size)
+            S, H = hybrid_uhf.expval_sharded(reshard(X, P("i")), Y, arrays=hamiltonian, rcond=rcond, max_degree=max_degree, factorization=factorization, cached_batch_size=cached_batch_size, pair_batch_size=pair_batch_size)
         return S[:, None, :, None], H[:, None, :, None]
-    S, H, *_ = compute_mels(impls.expval, X, reshard(X, P("i")), arrays=hamiltonian, batch_size=batch_size)
+    S, H, *_ = compute_mels(impls.expval, X, reshard(Y, P("i")), arrays=hamiltonian, batch_size=batch_size)
     return S, H

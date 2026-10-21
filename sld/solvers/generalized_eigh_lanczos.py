@@ -56,6 +56,11 @@ def _project_excited_effective_matrices(HH, SS, T, G, S_fixed, H_fixed, ne):
     Q = jax.lax.collapse(Q, 0, 2)
     Z = jax.lax.collapse(Z, 0, 2)
 
+    A, B, shift, lowrank = _excited_lowrank(A, B, T, G, Q, Z, S_inv, H_fixed)
+    return A, B, Pl, shift, lowrank
+
+
+def _excited_lowrank(A, B, T, G, Q, Z, S_inv, H_fixed):
     row_sharded = _uses_mesh_axis(jax.typeof(A).sharding.spec, 0)
     T_right = reshard(T, jax.P()) if row_sharded else T
     right = jnp.concatenate([Z, G], axis=1)
@@ -65,21 +70,16 @@ def _project_excited_effective_matrices(HH, SS, T, G, S_fixed, H_fixed, ne):
     left = jnp.concatenate([R, -Q], axis=1)
     A = A + jnp.matmul(left, right.T.conj(), out_sharding=jax.typeof(A).sharding)
     shift = jnp.einsum("ij,ji->", S_inv, H_fixed).real
-    return A, B, Pl, shift, (Q, T_right, left, right)
+    return A, B, shift, (Q, T_right, left, right)
 
 
-@partial(jax.jit, static_argnames=("nelec", "k", "precomp", "ncv", "tol"))
-def generalized_eigh_cholesky_lanczos_exc_tensor(HH, SS, T, G, S_fixed, H_fixed, nelec, k=1, ncv=255, x0=None, key=None, precomp=True, spin=None, tol=None):
-    # also returns (v^† SS v, v^† HH v)
-    ne, reg_mask = projection_rank(HH.shape[1], nelec, spin)
-    A, B, P, shift, (Q, T_right, left, right) = _project_excited_effective_matrices(HH, SS, T, G, S_fixed, H_fixed, ne)
-
+def _lanczos_exc(A, B, reg_mask, x0, lowrank, k, ncv, tol, key, precomp):
+    Q, T_right, left, right = lowrank
     B, reg = regularize(reshard(B, jax.P()), reg_mask)
     L = jax.lax.linalg.cholesky(B, symmetrize_input=False)
 
     if x0 is not None:
-        assert x0.shape == HH.shape[:2]
-        x0 = preprocess_guess(x0[None], P, L).ravel()
+        x0 = jnp.einsum("ji,j->i", L.conj(), x0)
 
     if precomp:
         C = precomputed_lanczos_operator(L, A)
@@ -87,12 +87,8 @@ def generalized_eigh_cholesky_lanczos_exc_tensor(HH, SS, T, G, S_fixed, H_fixed,
         C = Partial(matvec, A, L)
     e0, v0, info = eigsh(C, which="SA", k=k, ncv=ncv, tol=tol, dtype=A.dtype, shape=A.shape, v0=x0, key=key)
 
-    e0 = e0[:1] + shift
     y = v0.T[0]
-    v0 = postprocess(v0.T[:1], P, L=L)
-    v0 = reshard(v0, jax.P())
-
-    # v = P w, w = L^-† y
+    # w = L^-† y
     w = jax.lax.linalg.triangular_solve(L, y[:, None], left_side=True, lower=True, transpose_a=True, conjugate_a=True)[:, 0]
     wQ = reshard(Q, jax.P()).T.conj() @ w
     wT = reshard(T_right, jax.P()).T.conj() @ w
@@ -102,7 +98,68 @@ def generalized_eigh_cholesky_lanczos_exc_tensor(HH, SS, T, G, S_fixed, H_fixed,
     if reg is not None:
         s = s - (w.conj() * reg * w).sum().real
     h = (y.conj() @ C(y)).real - (wl.conj() @ wr).real
-    return e0, v0, info[1], (s, h)
+    return e0[:1], w, info[1], (s, h)
+
+
+@partial(jax.jit, static_argnames=("nelec", "k", "precomp", "ncv", "tol"))
+def generalized_eigh_cholesky_lanczos_exc_tensor(HH, SS, T, G, S_fixed, H_fixed, nelec, k=1, ncv=255, x0=None, key=None, precomp=True, spin=None, tol=None):
+    # also returns (v^† SS v, v^† HH v)
+    ne, reg_mask = projection_rank(HH.shape[1], nelec, spin)
+    A, B, P, shift, lowrank = _project_excited_effective_matrices(HH, SS, T, G, S_fixed, H_fixed, ne)
+    P = reshard(P, jax.P())
+
+    if x0 is not None:
+        assert x0.shape == HH.shape[:2]
+        x0 = jnp.einsum("aj,aji->ai", x0, P.conj()).ravel()
+
+    e0, w, info, sh = _lanczos_exc(A, B, reg_mask, x0, lowrank, k, ncv, tol, key, precomp)
+    v0 = jnp.einsum("aj,aij->ai", w.reshape(P.shape[0], P.shape[2]), P)[None]
+    return e0 + shift, v0, info, sh
+
+
+def _interleave(Tf, Tl):
+    # same layout as _concat: the 'l' rows are distributed over the 'f' determinants
+    Tl = reshard(Tl.reshape(Tf.shape[0], -1, *Tl.shape[1:]), jax.typeof(Tf).sharding.spec)
+    return jax.lax.collapse(jnp.concatenate([Tf, Tl], axis=1), 0, 2)
+
+
+@partial(jax.jit, static_argnames=("nelec", "k", "precomp", "ncv", "tol"))
+def generalized_eigh_partial_cholesky_lanczos_exc_tensor(Sff, Hff, Sfl, Hfl, Sll, Hll, Tf, Gf, Tl, Gl, S_fixed, H_fixed, nelec, k=1, ncv=255, x0f=None, x0l=None, key=None, precomp=True, spin=None, tol=None):
+    # also returns (v^† S v, v^† H v) of the optimized state
+    assert Sll.shape[0] % Sff.shape[0] == 0, "ndet_partial (number of 'f' determinants) must divide the number of 'l' determinants, see _concat"
+    nf = Sff.shape[0]
+    ne, reg_mask = projection_rank(Hff.shape[1], nelec, spin)
+    S_inv = jnp.linalg.inv(S_fixed)
+    Qf = jnp.einsum("ais,st->ait", Tf, S_inv, optimize="optimal")
+    S_diagonal = sh_diagonal(Sff)
+    S_eff_diagonal = S_diagonal - jnp.einsum("ais,ajs->aij", Qf, Tf.conj(), optimize="optimal", out_sharding=jax.typeof(S_diagonal).sharding)
+    P = compute_proj_mat_from_diagonal(S_eff_diagonal, ne)
+    Pl = reshard(P, jax.P(jax.typeof(Hff).sharding.spec[0]))
+    Pr = reshard(P, jax.P(jax.typeof(Hff).sharding.spec[2]))
+
+    A = _flatten(_concat(apply_proj(Hff, Pl, Pr), apply_projl(Hfl, Pl), Hll))
+    B = _concat_overlap_replicated(apply_proj(Sff, Pl, Pr), apply_projl(Sfl, Pl), Sll)
+    T = _interleave(apply_projl(Tf, Pl), Tl)
+    G = _interleave(apply_projl(Gf, Pl), Gl)
+    Q = T @ S_inv
+    Z = T @ S_inv.T.conj()
+    A, B, shift, lowrank = _excited_lowrank(A, B, T, G, Q, Z, S_inv, H_fixed)
+
+    if reg_mask is not None:
+        reg_mask = jnp.concatenate([reg_mask.reshape(nf, -1), jnp.ones((nf, Sll.shape[0] // nf), dtype=bool)], axis=1).ravel()
+
+    P = reshard(P, jax.P())
+    if x0f is not None:
+        x0f = jnp.einsum("aj,aji->ai", x0f, P.conj())
+        x0 = jnp.concatenate([x0f, x0l.reshape(nf, -1)], axis=1).ravel()
+    else:
+        x0 = None
+
+    e0, w, info, sh = _lanczos_exc(A, B, reg_mask, x0, lowrank, k, ncv, tol, key, precomp)
+    w = w.reshape(nf, -1)
+    v0f = jnp.einsum("aj,aij->ai", w[:, : P.shape[2]], P)
+    v0l = w[:, P.shape[2] :].ravel()
+    return e0 + shift, v0f, v0l, info, sh
 
 
 @partial(jax.jit, static_argnames=("nelec"))
